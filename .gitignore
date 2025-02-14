@@ -1,0 +1,8 @@
+#Data Files
+*.csv
+*.xlsx
+#Results
+*.png
+results/
+#VirtualEnvironment
+venv/
