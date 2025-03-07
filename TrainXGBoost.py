@@ -46,26 +46,26 @@ def remove_soc_first_fevers(df, tt_fever_start_col, soc_fever_start_col):
 
     return df[mask]
 
-def get_features_data(data, features):
-    print('Total Number of Unique TempTraq Fevers', data['TF_ID'].nunique())
-    print(data\
+def get_features_df(df, features):
+    print('Total Number of Unique TempTraq Fevers', df['TF_ID'].nunique())
+    print(df\
           .groupby('label')\
           ['TF_ID'].nunique())
     
-    data_features = data[features]
+    df_features = df[features]
 
-    data_features = data_features\
+    df_features = df_features\
         .rename({'GenderCode': 'Gender', 'RaceName': 'Race', 'TT Fever Start (DPI)_new': 'Fever_Start_from_Infusion(TT)', 'TTemp_Max_TT_new': 'Max_Temp_Within_2Hrs_Fever_Onset'}, axis =1)
 
-    labels = data_features['label']
+    labels = df_features['label']
 
-    data_features = data_features.drop('label', axis = 1)
+    df_features = df_features.drop('label', axis = 1)
 
-    for col in data_features.select_dtypes(include='object').columns:
-        data_features[col] = data_features[col].astype('category')
+    for col in df_features.select_dtypes(include='object').columns:
+        df_features[col] = df_features[col].astype('category')
         
-    tf_ids = data['TF_ID']
-    return tf_ids, data_features, labels
+    tf_ids = df['TF_ID']
+    return tf_ids, df_features, labels
 
 
 def custom_objective_function(preds, dtrain, alpha):
@@ -331,65 +331,6 @@ def plot_results(results, save_fig = True):
     metrics_mean = results['threshold_metrics']['mean']
     metrics_std = results['threshold_metrics']['std']
     
-    ax1.plot(metrics_mean['recall'], metrics_mean['precision'], 'b-', label=f'Mean PR curve (Mean-AUPRC: {round(np.nanmean(results["auprc"]), 2)})')
-    ax1.fill_between(
-        metrics_mean['recall'],
-        metrics_mean['precision'] - metrics_std['precision'],
-        metrics_mean['precision'] + metrics_std['precision'],
-        alpha=0.2
-    )
-    ax1.set_title(f'Precision-Recall Curve')
-    ax1.set_xlabel('Recall')
-    ax1.set_ylabel('Precision')
-    ax1.legend()
-    
-    # Plot F1 curve with confidence intervals
-    ax2.plot(metrics_mean.index, metrics_mean['f1'], 'g-', label='Mean F1')
-    ax2.fill_between(
-        metrics_mean.index,
-        metrics_mean['f1'] - metrics_std['f1'],
-        metrics_mean['f1'] + metrics_std['f1'],
-        alpha=0.2
-    )
-    ax2.axvline(results['optimal_thresholds']['f1'], color='r', linestyle='--', 
-                label=f"Optimal F1 threshold: {results['optimal_thresholds']['f1']:.3f}")
-    ax2.set_title('F1 Score vs Threshold')
-    ax2.set_xlabel('Threshold')
-    ax2.set_ylabel('F1 Score')
-    ax2.legend()
-    
-    # Plot top feature importance
-    top_features = results['feature_importance'].head(10)
-    sns.barplot(x=top_features['mean_importance'], y=top_features.index, ax=ax3)
-    ax3.set_title('Top 10 Feature Importance')
-    ax3.set_xlabel('Mean Importance')
-    
-    # Plot metrics at optimal thresholds
-    optimal_metrics = pd.DataFrame([
-        {
-            'Metric': metric,
-            'Value': metrics_mean.loc[threshold][['precision', 'recall', 'f1']].values[0]
-        }
-        for metric, threshold in results['optimal_thresholds'].items()
-        for metric_type in ['Precision', 'Recall', 'F1']
-    ])
-    sns.barplot(data=optimal_metrics, x='Value', y='Metric', ax=ax4)
-    ax4.set_title('Metrics at Optimal Thresholds')
-
-    plt.tight_layout()
-    if save_fig:
-        fig.savefig(f'{n_splits}_Results.png')
-    return fig
-
-
-def plot_results(results, save_fig = True):
-    """Plot evaluation results including performance curves"""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Plot PR curve with confidence intervals
-    metrics_mean = results['threshold_metrics']['mean']
-    metrics_std = results['threshold_metrics']['std']
-    
     ax1.plot(metrics_mean['recall'], metrics_mean['precision'], 'b-', label='Mean PR curve')
     ax1.fill_between(
         metrics_mean['recall'],
@@ -441,7 +382,7 @@ def plot_results(results, save_fig = True):
 
 
 if __name__=='__main__':
-    data = pd.read_excel('0204_Training_Target_Abx.xlsx')
+    df = pd.read_excel('0204_Training_Target_Abx.xlsx')
     features = ['Age',
        'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label',
        'TTemp__cwt_coefficients__coeff_11__w_5__widths_(2, 5, 10, 20)',
@@ -450,11 +391,11 @@ if __name__=='__main__':
        'TTemp__fft_coefficient__attr_"real"__coeff_24',
        'TTemp__agg_linear_trend__attr_"rvalue"__chunk_len_50__f_agg_"mean"']
     
-    tf_ids, data_features, labels = get_features_data(data, features)
+    tf_ids, df_features, labels = get_features_df(df, features)
     # Usage example
     n_splits = 100
     evaluator = XGBoostEvaluator(n_splits= n_splits, test_size=0.2, n_threshold_points=1000)
-    results = evaluator.evaluate_multiple_splits(data_features, labels)
+    results = evaluator.evaluate_multiple_splits(df_features, labels)
     
     print("\nModel Performance Summary:")
     print("-------------------------")
