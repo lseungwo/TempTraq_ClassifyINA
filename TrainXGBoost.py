@@ -11,7 +11,7 @@ from xgboost import (
     plot_tree)
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, GridSearchCV
 from sklearn.metrics import (
     classification_report,
     precision_recall_curve,
@@ -29,10 +29,10 @@ import matplotlib.pyplot as plt
 import itertools
 import warnings
 
-
 def assign_labels(df, category_col = 'Category'):
     """Assigns labels as 0 or 1 based on the category_col Values"""
     pass
+
 
 def remove_pediatric_patients(df, age_threshold):
     """Remove patients who can be considered pediatric patients (decides based on given age_thresholds)"""
@@ -112,13 +112,12 @@ class XGBoostEvaluator:
         # Base parameters that won't be tuned
         self.base_params = {
             "objective": "binary:logistic",
-            "eval_metric": "aucpr"
+            "eval_metric": "aucpr",
+            "scale_pos_weight": 4.55
         }
         
         # Parameter grid for tuning
         self.param_grid = {
-            'scale_pos_weight': [1, 2, 3, 4, 5, 6], 
-            'alpha' :[1, 2, 3, 4, 5, 6], 
             'max_depth': [3, 4, 5, 6],
             'min_child_weight': [1, 3, 5],
             'gamma': [0, 0.1, 0.2],
@@ -135,32 +134,32 @@ class XGBoostEvaluator:
         tp = np.sum((y_true == 1) & (y_pred == 1))
         fp = np.sum((y_true == 0) & (y_pred == 1))
         fn = np.sum((y_true == 1) & (y_pred == 0))
-        tn = np.sum((y_true == 0) & (y_pred == 0))
-       
         
         # Calculate precision and recall
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        fpr = fp/ (tn+fp) if (tn + fp) > 0 else 0 
         
         # Calculate F1 score
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         
-        return precision, recall, f1, fpr
+        return precision, recall, f1
 
-     def evaluate_single_split(self, X, y, random_state):                                                                              |      def evaluate_single_split(self, X, y, random_state):
-        """Evaluate model on a single train-test split using StratifiedShuffleSplit"""                                                |          """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
-        def strat_shuff_split(X, y, random_state):                                                                                    |          # Initial train-test split using StratifiedShuffleSplit                                                                      
-            # Initial train-test split using StratifiedShuffleSplit                                                                   |          sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)                                
-            sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)                             |          train_idx, test_idx = next(sss.split(X, y))                                                                                  
-            X_train, X_test, y_train, y_test = X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx]               |          y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]                                                                        
-                                                                                                                                        |          
-              # Scale features if requested                                                                                             |          # Scale features if requested                                                                                                
-              if self.scale_features:                                                                                                   |          if self.scale_features:                                                                                                      
-                  scaler = StandardScaler()                                                                                             |              scaler = StandardScaler()                                                                                                
-                  X_train = scaler.fit_transform(X_train)                                                                               |              X_train = scaler.fit_transform(X_train)                                                                                  
-                  X_test = scaler.transform(X_test)       ef evaluate_single_split(self, X, y, random_state):
+    def evaluate_single_split(self, X, y, random_state):
+        """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
+        # Initial train-test split using StratifiedShuffleSplit
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
+        train_idx, test_idx = next(sss.split(X, y))
 
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        # Scale features if requested
+        if self.scale_features:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+
+        # Convert to DMatrix
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dtest = xgb.DMatrix(X_test, label=y_test)
 
