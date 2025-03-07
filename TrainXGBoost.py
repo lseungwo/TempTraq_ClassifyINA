@@ -11,7 +11,7 @@ from xgboost import (
     plot_tree)
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, GridSearchCV
 from sklearn.metrics import (
     classification_report,
     precision_recall_curve,
@@ -68,7 +68,7 @@ def get_features_data(data, features):
     return tf_ids, data_features, labels
 
 
-def custom_objective_function(preds, dtrain):
+def custom_objective_function(preds, dtrain, alpha):
     """
     Custom objective function that:
     - Gives high penalty for missing any true positives (false negatives).
@@ -112,12 +112,13 @@ class XGBoostEvaluator:
         # Base parameters that won't be tuned
         self.base_params = {
             "objective": "binary:logistic",
-            "eval_metric": "aucpr",
-            "scale_pos_weight": 4.55
+            "eval_metric": "aucpr"
         }
         
         # Parameter grid for tuning
         self.param_grid = {
+            'scale_pos_weight': [1, 2, 3, 4, 5, 6], 
+            'alpha' :[1, 2, 3, 4, 5, 6], 
             'max_depth': [3, 4, 5, 6],
             'min_child_weight': [1, 3, 5],
             'gamma': [0, 0.1, 0.2],
@@ -149,74 +150,75 @@ class XGBoostEvaluator:
 
     def evaluate_single_split(self, X, y, random_state):
         """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
+        def strat_shuff_split(X, y, random_state):
+            # Initial train-test split using StratifiedShuffleSplit
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
+            train_idx, test_idx = next(sss.split(X, y))
 
-        # Initial train-test split using StratifiedShuffleSplit
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
-        train_idx, test_idx = next(sss.split(X, y))
+            X_train, X_test, y_train, y_test = X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx]
 
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            # Scale features if requested
+            if self.scale_features:
+                scaler = StandardScaler()
+                X_train = scaler.fit_transform(X_train)
+                X_test = scaler.transform(X_test)
 
-        # Scale features if requested
-        if self.scale_features:
-            scaler = StandardScaler()
-            X_train = scaler.fit_transform(X_train)
-            X_test = scaler.transform(X_test)
+            
+            return X_train, X_test, y_train, y_test
+
+        def grid_search(dtrain, random_state):
+            xgb_model = XGBClassifier(**self.base_params)
+
+            # Cross-validation splitter for parameter tuning
+            cv_splitter = StratifiedShuffleSplit(
+                n_splits=5,
+                test_size=0.2,
+                random_state=random_state
+            )
+
+                # Create GridSearchCV with custom objective function
+            grid_search = GridSearchCV(
+                estimator=xgb_model,
+                param_grid=self.param_grid,
+                scoring='average_precision',  # AUCPR as the scoring metric
+                cv=cv_splitter,  # Use StratifiedShuffleSplit as cross-validation
+                verbose=1,
+                n_jobs=-1  # Use all CPU cores for parallel computation
+            )
+
+            # Run the grid search
+            grid_search.fit(X_train, y_train)
+
+            # Get the best parameters and best score
+            best_params = grid_search.best_params_
+            best_score = grid_search.best_score_
+
+            return best_params, best_score
+    
+    
+        X_train, X_test, y_train, y_test = strat_shuff_split(X, y, random_state)
 
         # Convert to DMatrix
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dtest = xgb.DMatrix(X_test, label=y_test)
 
-        # Generate parameter combinations
-        param_combinations = [
-            dict(zip(self.param_grid.keys(), v)) 
-            for v in itertools.product(*self.param_grid.values())
-        ]
+        best_params, best_score = grid_search(dtrain, random_state)
 
-        # Cross-validation splitter for parameter tuning
-        cv_splitter = StratifiedShuffleSplit(
-            n_splits=5,
-            test_size=0.2,
-            random_state=random_state
-        )
 
-        # Store results for each parameter combination
-        cv_results_all = []
+        
+        # Extract alpha for final model training
+        final_alpha = best_params.pop('alpha')
 
-        # Perform cross-validation for each parameter combination
-        for params in param_combinations:
-            # Combine base parameters with current parameter set
-            current_params = {**self.base_params, **params}
 
-            cv_results = xgb.cv(
-                params=current_params,
-                dtrain=dtrain,
-                num_boost_round=1000,
-                folds=list(cv_splitter.split(X_train, y_train)),
-                early_stopping_rounds=self.early_stopping_rounds,
-                obj=custom_objective_function,
-                verbose_eval=False,
-                metrics=['aucpr']  # Changed to AUCPR to match base params
-            )
-
-            # Store results
-            cv_results_all.append({
-                'params': current_params,
-                'cv_results': cv_results,
-                'best_score': cv_results['test-aucpr-mean'].max(),  # Changed to AUCPR
-                'best_iteration': len(cv_results)
-            })
-
-        # Find best parameters
-        best_cv_result = max(cv_results_all, key=lambda x: x['best_score'])
-        best_params = best_cv_result['params']
-        best_num_rounds = best_cv_result['best_iteration']
-
+        # Create final objective function with best alpha
+        def final_objective(preds, dtrain):
+            return custom_objective_function(preds, dtrain, alpha=final_alpha)
+        
         # Train final model with best parameters
         model = xgb.train(
             params=best_params,
             dtrain=dtrain,
-            obj = custom_objective_function,
+            obj = final_objective,
             num_boost_round=best_num_rounds,
             evals=[(dtest, "test")],
             verbose_eval=False
@@ -276,7 +278,7 @@ class XGBoostEvaluator:
 
         
         for i in range(self.n_splits):
-            if i%100==0:
+            if i%10==0:
                 print(f'{i+1} split')
             split_result = self.evaluate_single_split(X, y, random_state=i)
             all_threshold_metrics.append(split_result['threshold_metrics'])
@@ -340,6 +342,64 @@ def plot_results(results, save_fig = True):
     ax1.set_xlabel('Recall')
     ax1.set_ylabel('Precision')
     ax1.legend()
+    
+    # Plot F1 curve with confidence intervals
+    ax2.plot(metrics_mean.index, metrics_mean['f1'], 'g-', label='Mean F1')
+    ax2.fill_between(
+        metrics_mean.index,
+        metrics_mean['f1'] - metrics_std['f1'],
+        metrics_mean['f1'] + metrics_std['f1'],
+        alpha=0.2
+    )
+    ax2.axvline(results['optimal_thresholds']['f1'], color='r', linestyle='--', 
+                label=f"Optimal F1 threshold: {results['optimal_thresholds']['f1']:.3f}")
+    ax2.set_title('F1 Score vs Threshold')
+    ax2.set_xlabel('Threshold')
+    ax2.set_ylabel('F1 Score')
+    ax2.legend()
+    
+    # Plot top feature importance
+    top_features = results['feature_importance'].head(10)
+    sns.barplot(x=top_features['mean_importance'], y=top_features.index, ax=ax3)
+    ax3.set_title('Top 10 Feature Importance')
+    ax3.set_xlabel('Mean Importance')
+    
+    # Plot metrics at optimal thresholds
+    optimal_metrics = pd.DataFrame([
+        {
+            'Metric': metric,
+            'Value': metrics_mean.loc[threshold][['precision', 'recall', 'f1']].values[0]
+        }
+        for metric, threshold in results['optimal_thresholds'].items()
+        for metric_type in ['Precision', 'Recall', 'F1']
+    ])
+    sns.barplot(data=optimal_metrics, x='Value', y='Metric', ax=ax4)
+    ax4.set_title('Metrics at Optimal Thresholds')
+
+    plt.tight_layout()
+    if save_fig:
+        fig.savefig(f'{n_splits}_Results.png')
+    return fig
+
+
+def plot_results(results, save_fig = True):
+    """Plot evaluation results including performance curves"""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Plot PR curve with confidence intervals
+    metrics_mean = results['threshold_metrics']['mean']
+    metrics_std = results['threshold_metrics']['std']
+    
+    ax1.plot(metrics_mean['recall'], metrics_mean['precision'], 'b-', label='Mean PR curve')
+    ax1.fill_between(
+        metrics_mean['recall'],
+        metrics_mean['precision'] - metrics_std['precision'],
+        metrics_mean['precision'] + metrics_std['precision'],
+        alpha=0.2
+    )
+    ax1.set_title('Precision-Recall Curve')
+    ax1.set_xlabel('Recall')
+    ax1.set_ylabel('Precision')
     
     # Plot F1 curve with confidence intervals
     ax2.plot(metrics_mean.index, metrics_mean['f1'], 'g-', label='Mean F1')
