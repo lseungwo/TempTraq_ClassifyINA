@@ -68,7 +68,7 @@ def get_features_df(df, features, label_col):
     return tf_ids, df_features, labels
 
 
-def custom_objective_function(preds, dtrain, alpha):
+def custom_objective_function(preds, dtrain, alpha = 5.5):
     """
     Custom objective function that:
     - Gives high penalty for missing any true positives (false negatives).
@@ -123,7 +123,8 @@ class XGBoostEvaluator:
             'gamma': [0, 0.1, 0.2],
             'subsample': [0.8, 0.9, 1.0],
             'colsample_bytree': [0.8, 0.9, 1.0],
-            'learning_rate': [0.01, 0.05, 0.1]
+            'learning_rate': [0.01, 0.05, 0.1],
+            'alpha': [1, 5, 6, 7, 10]
         }
     
     def calculate_metrics_at_threshold(self, y_true, y_pred_proba, threshold):
@@ -267,6 +268,7 @@ class XGBoostEvaluator:
         all_threshold_metrics = []
         feature_importances = []
         best_params_list = []
+        auprc_list = []
         
         for i in range(self.n_splits):
             if i%1==0:
@@ -275,6 +277,7 @@ class XGBoostEvaluator:
             all_threshold_metrics.append(split_result['threshold_metrics'])
             feature_importances.append(split_result['feature_importance'])
             best_params_list.append(split_result['best_params'])
+            auprc_list.append(split_result['auprc'])
         
         # Calculate mean and std of metrics across all splits for each threshold
         threshold_metrics_mean = pd.concat(all_threshold_metrics).groupby('threshold').mean()
@@ -309,7 +312,8 @@ class XGBoostEvaluator:
             'feature_importance': pd.DataFrame({
                 'mean_importance': mean_importance,
                 'std_importance': std_importance
-            }).sort_values('mean_importance', ascending=False)\
+            }).sort_values('mean_importance', ascending=False),\
+            'auprc': auprc_list
             # ,'parameter_summary': pd.DataFrame({
             #     'mean_value': mean_params,
             #     'std_value': std_params
@@ -375,14 +379,10 @@ def plot_results(results, save_fig = True):
 
 
 if __name__=='__main__':
-    df = pd.read_excel('0204_Training_Target_Abx.xlsx')
-    features = ['Age',
-       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label',
-       'TTemp__cwt_coefficients__coeff_11__w_5__widths_(2, 5, 10, 20)',
-       'TTemp__ar_coefficient__coeff_9__k_10',
-       'TTemp__change_quantiles__f_agg_"mean"__isabs_True__qh_1.0__ql_0.6',
-       'TTemp__fft_coefficient__attr_"real"__coeff_24',
-       'TTemp__agg_linear_trend__attr_"rvalue"__chunk_len_50__f_agg_"mean"']
+    df = pd.read_excel('0307_Training_with_Filter.xlsx')
+    features = ['Age', 
+       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label_abx','TTemp_Interp__fft_coefficient__attr_"real"__coeff_45',
+       'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_2']
     
     tf_ids, df_features, labels = get_features_df(df, features)
     # Usage example
