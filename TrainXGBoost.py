@@ -68,7 +68,7 @@ def get_features_df(df, features, label_col):
     return tf_ids, df_features, labels
 
 
-def custom_objective_function(preds, dtrain, alpha = 5.5):
+def custom_objective_function(preds, dtrain, alpha = 6):
     """
     Custom objective function that:
     - Gives high penalty for missing any true positives (false negatives).
@@ -101,19 +101,30 @@ class XGBoostEvaluator:
         test_size=0.2,
         early_stopping_rounds=10,
         scale_features=True,
-        n_threshold_points=10  # Number of threshold points to evaluate
+        n_threshold_points=10,  # Number of threshold points to evaluate
+        gridSearch = True
     ):
         self.n_splits = n_splits
         self.test_size = test_size
         self.early_stopping_rounds = early_stopping_rounds
         self.scale_features = scale_features
         self.n_threshold_points = n_threshold_points
+        self.gridSearch = gridSearch
         
         # Base parameters that won't be tuned
         self.base_params = {
             "objective": "binary:logistic",
             "eval_metric": "aucpr",
-            "scale_pos_weight": 4.55
+            "scale_pos_weight": 6
+        }
+        
+        self.safe_params = {
+            "max_depth": 4,
+            'min_child_weight': 3,
+            'gamma': 0.1,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "learning_rate": 0.1
         }
         
         # Parameter grid for tuning
@@ -124,7 +135,8 @@ class XGBoostEvaluator:
             'subsample': [0.8, 0.9, 1.0],
             'colsample_bytree': [0.8, 0.9, 1.0],
             'learning_rate': [0.01, 0.05, 0.1],
-            'alpha': [1, 5, 6, 7, 10]
+            # "scale_pos_weight": [1 ,2, 3, 4, 5, 6]
+            # 'alpha': [1, 5, 6, 7, 10]
         }
     
     def calculate_metrics_at_threshold(self, y_true, y_pred_proba, threshold):
@@ -134,7 +146,9 @@ class XGBoostEvaluator:
         # Count true positives, false positives, false negatives
         tp = np.sum((y_true == 1) & (y_pred == 1))
         fp = np.sum((y_true == 0) & (y_pred == 1))
+        tn = np.sum((y_true == 0) & (y_pred == 0))
         fn = np.sum((y_true == 1) & (y_pred == 0))
+        
         
         # Calculate precision and recall
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
@@ -142,142 +156,182 @@ class XGBoostEvaluator:
         
         # Calculate F1 score
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+        auprc = average_precision_score(y_true, y_pred_proba)
         
-        return precision, recall, f1
+        return precision, recall, f1, auprc
 
     def evaluate_single_split(self, X, y, random_state):
         """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
-        # Initial train-test split using StratifiedShuffleSplit
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
-        train_idx, test_idx = next(sss.split(X, y))
+        def stratified_shuffle_split(X, y, random_state=random_state):
+            # Initial train-test split using StratifiedShuffleSplit
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
+            train_idx, test_idx = next(sss.split(X, y))
 
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        # Scale features if requested
-        if self.scale_features:
+            return X_train, X_test, y_train, y_test
+        
+        def scale_features(X_train, X_test):
+            # Scale features if requested
             scaler = StandardScaler()
             X_train = scaler.fit_transform(X_train)
             X_test = scaler.transform(X_test)
 
-        # Convert to DMatrix
-        dtrain = xgb.DMatrix(X_train, label=y_train)
-        dtest = xgb.DMatrix(X_test, label=y_test)
+            return X_train, X_test
+        
+        def convert_to_dmatrix(X_train, y_train, X_test, y_test):
+            # Convert to DMatrix
+            dtrain = xgb.DMatrix(X_train, label=y_train)
+            dtest = xgb.DMatrix(X_test, label=y_test)
 
-        # Generate parameter combinations
+            return dtrain, dtest
+
+
+        def cross_validation_for_best_parameter(X_train, y_train, dtrain, param_combinations, test_size = 0.2, random_state = random_state, gridSearch = True):
+            def cv(current_params):
+                cv_results = xgb.cv(
+                        params=current_params,
+                        dtrain=dtrain,
+                        num_boost_round=1000,
+                        folds=list(cv_splitter.split(X_train, y_train)),
+                        early_stopping_rounds=self.early_stopping_rounds,
+                        obj=custom_objective_function,
+                        verbose_eval=False,
+                        metrics=['aucpr']  # Changed to AUCPR to match base params
+                    )
+
+                    # Store results
+                cv_results_all.append({
+                    'params': current_params,
+                    'cv_results': cv_results,
+                    'best_score': cv_results['test-aucpr-mean'].max(),  # Changed to AUCPR
+                    'best_iteration': len(cv_results)
+                })
+
+            # Cross-validation splitter for parameter tuning
+            cv_splitter = StratifiedShuffleSplit(
+                n_splits=5,
+                test_size=test_size,
+                random_state=random_state
+            )
+
+            # Store results for each parameter combination
+            cv_results_all = []
+
+            # Perform cross-validation for each parameter combination
+            if gridSearch:
+                for params in param_combinations:
+                    # Combine base parameters with current parameter set
+                    current_params = {**self.base_params, **params}
+                    cv(current_params)
+            
+            else:
+                current_params = {**self.base_params, **self.safe_params}
+                cv(current_params)
+
+            return cv_results_all
+        
+
+        def train_model(dtrain, dtest, y_test, best_params, best_num_rounds):
+            # Train final model with best parameters
+            model = xgb.train(
+                params=best_params,
+                dtrain=dtrain,
+                obj = custom_objective_function,
+                num_boost_round=best_num_rounds,
+                evals=[(dtest, "test")],
+                verbose_eval=False
+            )
+
+            # Predictions
+            y_pred_proba = model.predict(dtest)
+            
+            # After getting predictions, calculate metrics across thresholds
+            thresholds = np.linspace(0, 1, self.n_threshold_points)
+            threshold_metrics = []
+            
+            for threshold in thresholds:
+                precision, recall, f1, auprc = self.calculate_metrics_at_threshold(
+                    y_test, y_pred_proba, threshold
+                )
+                threshold_metrics.append({
+                    'threshold': threshold,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
+                    'auprc': auprc
+                })
+            
+            threshold_metrics_df = pd.DataFrame(threshold_metrics)
+            
+            return model, y_pred_proba, threshold_metrics_df
+        
+
+        X_train, X_test, y_train, y_test = stratified_shuffle_split(X, y, random_state)
+
+        if self.scale_features:
+            X_train, X_test = scale_features(X_train, X_test)
+
+        dtrain, dtest = convert_to_dmatrix(X_train, y_train, X_test, y_test)
+
+
+
+         # Generate parameter combinations
         param_combinations = [
             dict(zip(self.param_grid.keys(), v)) 
             for v in itertools.product(*self.param_grid.values())
         ]
 
-        # Cross-validation splitter for parameter tuning
-        cv_splitter = StratifiedShuffleSplit(
-            n_splits=5,
-            test_size=0.2,
-            random_state=random_state
-        )
-
-        # Store results for each parameter combination
-        cv_results_all = []
-
-        # Perform cross-validation for each parameter combination
-        for params in param_combinations:
-            # Combine base parameters with current parameter set
-            current_params = {**self.base_params, **params}
-
-            cv_results = xgb.cv(
-                params=current_params,
-                dtrain=dtrain,
-                num_boost_round=1000,
-                folds=list(cv_splitter.split(X_train, y_train)),
-                early_stopping_rounds=self.early_stopping_rounds,
-                obj=custom_objective_function,
-                verbose_eval=False,
-                metrics=['aucpr']  # Changed to AUCPR to match base params
-            )
-
-            # Store results
-            cv_results_all.append({
-                'params': current_params,
-                'cv_results': cv_results,
-                'best_score': cv_results['test-aucpr-mean'].max(),  # Changed to AUCPR
-                'best_iteration': len(cv_results)
-            })
-
+        cv_results_all = cross_validation_for_best_parameter(X_train, y_train, dtrain, param_combinations, test_size = 0.2, random_state = random_state, gridSearch = self.gridSearch)
+        
         # Find best parameters
         best_cv_result = max(cv_results_all, key=lambda x: x['best_score'])
         best_params = best_cv_result['params']
         best_num_rounds = best_cv_result['best_iteration']
+        
+        model, y_pred_proba, threshold_metrics_df = train_model(dtrain, dtest, y_test, best_params, best_num_rounds)
 
-        # Train final model with best parameters
-        model = xgb.train(
-            params=best_params,
-            dtrain=dtrain,
-            obj = custom_objective_function,
-            num_boost_round=best_num_rounds,
-            evals=[(dtest, "test")],
-            verbose_eval=False
-        )
-
-        # Predictions
-        y_pred_proba = model.predict(dtest)
-        
-        # After getting predictions, calculate metrics across thresholds
-        thresholds = np.linspace(0, 1, self.n_threshold_points)
-        threshold_metrics = []
-        
-        for threshold in thresholds:
-            precision, recall, f1 = self.calculate_metrics_at_threshold(
-                y_test, y_pred_proba, threshold
-            )
-            threshold_metrics.append({
-                'threshold': threshold,
-                'precision': precision,
-                'recall': recall,
-                'f1': f1
-            })
-        
-        threshold_metrics_df = pd.DataFrame(threshold_metrics)
-        
-        # Calculate AUPRC
-        auprc = average_precision_score(y_test, y_pred_proba)
-        
         # Get feature importance
         importance_dict = {
             name: score for name, score in 
             zip(X.columns, model.get_score(importance_type='gain').values())
         }
-        
+
         # Get predictions at optimal threshold
         optimal_threshold = 0.5
-        y_pred = (y_pred_proba >= optimal_threshold).astype(int)
+        precision, recall,  f1, auprc = self.calculate_metrics_at_threshold(y_test, y_pred_proba, optimal_threshold) 
+        optimal_threshold_performance = {'precision': precision, 'recall': recall, 'f1': f1, 'auprc': auprc}
+        
         
         return {
+            'optimal_thresholds_performance': optimal_threshold_performance,
             'threshold_metrics': threshold_metrics_df,
-            'auprc': auprc,
             'feature_importance': importance_dict,
-            'predictions': y_pred,
             'probabilities': y_pred_proba,
             'true_labels': y_test,
             'best_params': best_params,
-            'best_cv_score': best_cv_result['best_score']
+            'cv_results_all': cv_results_all
         }
     
     def evaluate_multiple_splits(self, X, y):
         """Evaluate model across multiple train-test splits"""
+        model_performance = []
         all_threshold_metrics = []
         feature_importances = []
-        best_params_list = []
-        auprc_list = []
+        best_params = []
+        cv_results = []
         
         for i in range(self.n_splits):
             if i%1==0:
                 print(f'{i+1} split')
             split_result = self.evaluate_single_split(X, y, random_state=i)
+            model_performance.append(split_result['optimal_thresholds_performance'])
             all_threshold_metrics.append(split_result['threshold_metrics'])
             feature_importances.append(split_result['feature_importance'])
-            best_params_list.append(split_result['best_params'])
-            auprc_list.append(split_result['auprc'])
+            best_params.append(split_result['best_params'])
+            cv_results.append(pd.DataFrame(split_result['cv_results_all']))
         
         # Calculate mean and std of metrics across all splits for each threshold
         threshold_metrics_mean = pd.concat(all_threshold_metrics).groupby('threshold').mean()
@@ -297,10 +351,8 @@ class XGBoostEvaluator:
         mean_importance = importance_df.mean()
         std_importance = importance_df.std()
         
-        # Aggregate feature importances
-        importance_df = pd.DataFrame(feature_importances)
-        mean_importance = importance_df.mean()
-        std_importance = importance_df.std()
+        model_performance = pd.DataFrame(model_performance)
+        cv_results = pd.concat(cv_results)
         
         # Rest of the aggregation code remains the same
         return {
@@ -313,11 +365,8 @@ class XGBoostEvaluator:
                 'mean_importance': mean_importance,
                 'std_importance': std_importance
             }).sort_values('mean_importance', ascending=False),\
-            'auprc': auprc_list
-            # ,'parameter_summary': pd.DataFrame({
-            #     'mean_value': mean_params,
-            #     'std_value': std_params
-            # })
+            'model_performance_at0.5': model_performance,
+            'cv_results_agg' : cv_results
         }
 
 def plot_results(results, save_fig = True):
@@ -374,25 +423,28 @@ def plot_results(results, save_fig = True):
 
     plt.tight_layout()
     if save_fig:
-        fig.savefig(f'{n_splits}_Results.png')
+        fig.savefig(f'results/{n_splits}_Results.png')
     return fig
 
 
 if __name__=='__main__':
-    df = pd.read_excel('0307_Training_with_Filter.xlsx')
+    df = pd.read_excel('Training0313_1to4_filter_abx0change.xlsx')
     features = ['Age', 
-       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label_abx','TTemp_Interp__fft_coefficient__attr_"real"__coeff_45',
-       'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_2']
+       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label_abx2','TTemp_Interp__fft_coefficient__attr_"real"__coeff_6', 'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_22']
     
-    tf_ids, df_features, labels = get_features_df(df, features)
+    tf_ids, df_features, labels = get_features_df(df, features, 'label_abx2')
     # Usage example
-    n_splits = 100
-    evaluator = XGBoostEvaluator(n_splits= n_splits, test_size=0.2, n_threshold_points=1000)
+    n_splits = 5
+    print(f'This script will build model {n_splits} times')
+    evaluator = XGBoostEvaluator(n_splits= n_splits, test_size=0.2, n_threshold_points=1000, gridSearch = False)
     results = evaluator.evaluate_multiple_splits(df_features, labels)
-    
+    results['model_performance_at0.5'].to_csv('results/performance_per_model.csv', index_label = 'Model#')
+    results['cv_results_agg'].to_csv('results/cv_results_agg.csv', index = False)
+
+
     print("\nModel Performance Summary:")
     print("-------------------------")
-    print(f'mean_auprc:{np.nanmean(results["auprc"])}')
+    print(f"mean_auprc:{np.nanmean(results['model_performance_at0.5']['auprc'])}")
 
     # Plot results
     plot_results(results)
