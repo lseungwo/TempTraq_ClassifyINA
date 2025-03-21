@@ -29,6 +29,14 @@ import matplotlib.pyplot as plt
 import itertools
 import warnings
 
+from datetime import datetime
+import os
+
+from model_logging import *
+
+import warnings
+
+
 def assign_labels(df, category_col = 'Category'):
     """Assigns labels as 0 or 1 based on the category_col Values"""
     pass
@@ -68,7 +76,7 @@ def get_features_df(df, features, label_col):
     return tf_ids, df_features, labels
 
 
-def custom_objective_function(preds, dtrain, alpha = 6):
+def custom_objective_function(preds, dtrain, alpha = 1, beta = 5):
     """
     Custom objective function that:
     - Gives high penalty for missing any true positives (false negatives).
@@ -86,7 +94,6 @@ def custom_objective_function(preds, dtrain, alpha = 6):
     grad[labels == 1] = alpha * (probs[labels == 1] - 1)  # Push towards predicting 1 for Class 1
 
     # Moderate penalty for Class 0 False Positives (FP), while allowing some flexibility
-    beta = 1  # Weight for FP penalty for Class 0
     grad[labels == 0] = beta * probs[labels == 0]  # Push towards predicting 0 for Class 0
 
     return grad, hess
@@ -115,7 +122,9 @@ class XGBoostEvaluator:
         self.base_params = {
             "objective": "binary:logistic",
             "eval_metric": "aucpr",
-            "scale_pos_weight": 6
+            "scale_pos_weight": 2,
+            'alpha': 1,
+            'beta': 3
         }
         
         self.safe_params = {
@@ -138,6 +147,11 @@ class XGBoostEvaluator:
             # "scale_pos_weight": [1 ,2, 3, 4, 5, 6]
             # 'alpha': [1, 5, 6, 7, 10]
         }
+
+        set_alpha = self.base_params.get('alpha', '')
+        set_spw = self.base_params.get('scale_pos_weight', '')
+        global training_file
+        set_experiment(f'{label_name}_{training_file}_{set_alpha}_{set_spw}')
     
     def calculate_metrics_at_threshold(self, y_true, y_pred_proba, threshold):
         """Calculate precision, recall, and F1 score at a given threshold"""
@@ -153,13 +167,15 @@ class XGBoostEvaluator:
         # Calculate precision and recall
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        fpr = fp/ (fp+tn) if (fp+tn) > 0 else 0
         
         # Calculate F1 score
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-        auprc = average_precision_score(y_true, y_pred_proba)
+        aucpr = average_precision_score(y_true, y_pred_proba)
         
-        return precision, recall, f1, auprc
+        return precision, recall, specificity, fpr, f1, aucpr
 
     def evaluate_single_split(self, X, y, random_state):
         """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
@@ -253,19 +269,20 @@ class XGBoostEvaluator:
             threshold_metrics = []
             
             for threshold in thresholds:
-                precision, recall, f1, auprc = self.calculate_metrics_at_threshold(
+                precision, recall, specificity, fpr, f1, aucpr = self.calculate_metrics_at_threshold(
                     y_test, y_pred_proba, threshold
                 )
                 threshold_metrics.append({
                     'threshold': threshold,
                     'precision': precision,
                     'recall': recall,
+                    'specificity': specificity,
+                    'fpr': fpr,
                     'f1': f1,
-                    'auprc': auprc
+                    'aucpr': aucpr
                 })
             
             threshold_metrics_df = pd.DataFrame(threshold_metrics)
-            
             return model, y_pred_proba, threshold_metrics_df
         
 
@@ -290,8 +307,11 @@ class XGBoostEvaluator:
         best_cv_result = max(cv_results_all, key=lambda x: x['best_score'])
         best_params = best_cv_result['params']
         best_num_rounds = best_cv_result['best_iteration']
-        
+
         model, y_pred_proba, threshold_metrics_df = train_model(dtrain, dtest, y_test, best_params, best_num_rounds)
+
+        best_params['num_boost_rounds'] = best_cv_result['best_iteration']
+        
 
         # Get feature importance
         importance_dict = {
@@ -301,9 +321,19 @@ class XGBoostEvaluator:
 
         # Get predictions at optimal threshold
         optimal_threshold = 0.5
-        precision, recall,  f1, auprc = self.calculate_metrics_at_threshold(y_test, y_pred_proba, optimal_threshold) 
-        optimal_threshold_performance = {'precision': precision, 'recall': recall, 'f1': f1, 'auprc': auprc}
+        precision, recall, specificity, fpr, f1, aucpr = self.calculate_metrics_at_threshold(y_test, y_pred_proba, optimal_threshold) 
+        optimal_threshold_performance = {
+                    'precision': precision,
+                    'recall': recall,
+                    'specificity': specificity,
+                    'fpr': fpr,
+                    'f1': f1,
+                    'aucpr': aucpr
+                }
         
+       
+        
+        log_model(model, best_params, aucpr, dtrain, random_state)
         
         return {
             'optimal_thresholds_performance': optimal_threshold_performance,
@@ -320,6 +350,7 @@ class XGBoostEvaluator:
         model_performance = []
         all_threshold_metrics = []
         feature_importances = []
+        pred_results = []
         best_params = []
         cv_results = []
         
@@ -330,6 +361,7 @@ class XGBoostEvaluator:
             model_performance.append(split_result['optimal_thresholds_performance'])
             all_threshold_metrics.append(split_result['threshold_metrics'])
             feature_importances.append(split_result['feature_importance'])
+            pred_results.append({'true':split_result['true_labels'], 'predicted':split_result['probabilities']})
             best_params.append(split_result['best_params'])
             cv_results.append(pd.DataFrame(split_result['cv_results_all']))
         
@@ -356,6 +388,7 @@ class XGBoostEvaluator:
         
         # Rest of the aggregation code remains the same
         return {
+            'threshold_all' : pd.concat(all_threshold_metrics),
             'threshold_metrics': {
                 'mean': threshold_metrics_mean,
                 'std': threshold_metrics_std
@@ -366,7 +399,8 @@ class XGBoostEvaluator:
                 'std_importance': std_importance
             }).sort_values('mean_importance', ascending=False),\
             'model_performance_at0.5': model_performance,
-            'cv_results_agg' : cv_results
+            'cv_results_agg' : cv_results,
+            'pred_results': pd.DataFrame(pred_results)
         }
 
 def plot_results(results, save_fig = True):
@@ -423,28 +457,52 @@ def plot_results(results, save_fig = True):
 
     plt.tight_layout()
     if save_fig:
-        fig.savefig(f'results/{n_splits}_Results.png')
+        fig.savefig(f'{directory_path}/{n_splits}_Results.png')
     return fig
 
 
 if __name__=='__main__':
-    df = pd.read_excel('Training0313_1to4_filter_abx0change.xlsx')
+    training_file = 'Training0321_1to4_filter_abx+engr.xlsx'
+    df = pd.read_excel(training_file)
+    label_name = 'label_engr'
+    turn_warnings = False
+    if not turn_warnings:
+        warnings.filterwarnings("ignore")
     features = ['Age', 
-       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new', 'label_abx2','TTemp_Interp__fft_coefficient__attr_"real"__coeff_6', 'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_22']
+       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new','TTemp_Interp__ar_coefficient__coeff_0__k_10',
+       'TTemp_Interp__change_quantiles__f_agg_"var"__isabs_False__qh_1.0__ql_0.6',
+       'TTemp_Interp__fft_coefficient__attr_"abs"__coeff_1',
+       'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_30',
+       'TTemp_Interp__agg_linear_trend__attr_"intercept"__chunk_len_10__f_agg_"var"',
+       'TTemp_Interp__energy_ratio_by_chunks__num_segments_10__segment_focus_9', label_name]
     
-    tf_ids, df_features, labels = get_features_df(df, features, 'label_abx2')
+    tf_ids, df_features, labels = get_features_df(df, features, label_name)
     # Usage example
-    n_splits = 5
+    n_splits = 1000
     print(f'This script will build model {n_splits} times')
-    evaluator = XGBoostEvaluator(n_splits= n_splits, test_size=0.2, n_threshold_points=1000, gridSearch = False)
+    evaluator = XGBoostEvaluator(n_splits= n_splits,  test_size=0.2,  scale_features = False, n_threshold_points=1000, gridSearch = True)
+    print('Building and evaluating the model..')
     results = evaluator.evaluate_multiple_splits(df_features, labels)
-    results['model_performance_at0.5'].to_csv('results/performance_per_model.csv', index_label = 'Model#')
-    results['cv_results_agg'].to_csv('results/cv_results_agg.csv', index = False)
+       
+    current_time =  datetime.now().replace(microsecond=0)
+
+    # Specify the directory path you want to create
+    directory_path = f"results/{current_time}"
+
+    # Create the directory
+    os.makedirs(directory_path, exist_ok=True)
+
+    results['model_performance_at0.5'].to_csv(directory_path+'/performance_per_model.csv', index_label = 'Model#')
+    results['cv_results_agg'].to_csv(directory_path +'/cv_results_agg.csv', index = False)
+    results['pred_results'].to_csv(directory_path+'/pred_results.csv', index = False)
+    results['threshold_all'].to_csv(directory_path+'/threshold_metrics.csv', index = False)
+    results['feature_importance'].to_csv(directory_path+'/feature_importance.csv', index = False)
+
 
 
     print("\nModel Performance Summary:")
     print("-------------------------")
-    print(f"mean_auprc:{np.nanmean(results['model_performance_at0.5']['auprc'])}")
+    print(f"mean_aucpr:{np.nanmean(results['model_performance_at0.5']['aucpr'])}")
 
     # Plot results
     plot_results(results)
