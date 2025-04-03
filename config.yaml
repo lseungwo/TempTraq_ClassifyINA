@@ -1,0 +1,12 @@
+label_name: 'label_engr'
+fp_penalize: 1.5
+fn_penalize: 1
+scale_pos_weight: 2.5
+turn_warnings: False
+num_splits: 100
+test_size: 0.2
+scale_features: False
+n_threshold_points: 1000
+gridSearch: True
+sample_scale_weight: 'sample_scale'
+early_stopping_rounds: 100
