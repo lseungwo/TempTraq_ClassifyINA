@@ -1,0 +1,13 @@
+#Data Files
+data/
+#Results
+*.png
+results/
+#VirtualEnvironment
+venv/
+#MLRun
+mlruns/
+mlflow.db
+#CacheFiles
+__pycache__/
+*.pyc
