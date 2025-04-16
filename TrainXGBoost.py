@@ -3,6 +3,7 @@
 
 import pandas as pd
 import numpy as np
+import re
 
 import xgboost as xgb
 from xgboost import (
@@ -32,9 +33,30 @@ import warnings
 from datetime import datetime
 import os
 
+from joblib import Parallel, delayed
+import time
+
 from model_logging import *
 
 import warnings
+
+import yaml
+import sqlite3
+
+def get_config(file = 'config.yaml'):
+    # config file
+    with open(file, "r") as f:
+        config = yaml.safe_load(f)
+    print("Loaded Configuration:")
+    for section, settings in config.items():
+        print(f"\n[{section}]")
+        if isinstance(settings, dict):
+            for key, value in settings.items():
+                print(f"{key}: {value}")
+        else:
+            print(settings)
+
+    return config
 
 
 def assign_labels(df, category_col = 'Category'):
@@ -54,7 +76,7 @@ def remove_soc_first_fevers(df, tt_fever_start_col, soc_fever_start_col):
 
     return df[mask]
 
-def get_features_df(df, features, label_col):
+def get_features_df(df, features, label_col, sample_scale_weight = None):
     print('Total Number of Unique TempTraq Fevers', df['TF_ID'].nunique())
     print(df\
           .groupby(label_col)\
@@ -65,66 +87,49 @@ def get_features_df(df, features, label_col):
     df_features = df_features\
         .rename({'GenderCode': 'Gender', 'RaceName': 'Race', 'TT Fever Start (DPI)_new': 'Fever_Start_from_Infusion(TT)', 'TTemp_Max_TT_new': 'Max_Temp_Within_2Hrs_Fever_Onset'}, axis =1)
 
-    labels = df_features[label_col]
-
-    df_features = df_features.drop(label_col, axis = 1)
+    labels = df[label_col]
 
     for col in df_features.select_dtypes(include='object').columns:
         df_features[col] = df_features[col].astype('category')
         
     tf_ids = df['TF_ID']
-    return tf_ids, df_features, labels
 
-
-def custom_objective_function(preds, dtrain, alpha = 1, beta = 5):
-    """
-    Custom objective function that:
-    - Gives high penalty for missing any true positives (false negatives).
-    - Maximizes the prediction of Class 0, while balancing recall for Class 1.
-    """
-    labels = dtrain.get_label()
-    probs = 1 / (1 + np.exp(-preds))  # Sigmoid to convert raw scores to probabilities
-
-    grad = np.zeros_like(probs)
-    hess = probs * (1 - probs)  # Standard logistic Hessian
-
-    # High penalty for false negatives (missing true positives)
-    # Particularly for Class 1, but you can adjust this to balance Class 0
-
-    grad[labels == 1] = alpha * (probs[labels == 1] - 1)  # Push towards predicting 1 for Class 1
-
-    # Moderate penalty for Class 0 False Positives (FP), while allowing some flexibility
-    grad[labels == 0] = beta * probs[labels == 0]  # Push towards predicting 0 for Class 0
-
-    return grad, hess
-
-
+    if sample_scale_weight:
+        sample_scale_weight = df[sample_scale_weight]
+    return tf_ids, df_features, labels, sample_scale_weight
 
 
 class XGBoostEvaluator:
     def __init__(
         self,
-        n_splits=10,
-        test_size=0.2,
+        num_splits=10,
+        test_size=0.5,
         early_stopping_rounds=10,
-        scale_features=True,
+        scale_features = False,
         n_threshold_points=10,  # Number of threshold points to evaluate
-        gridSearch = True
+        gridSearch = True,
+        label_name = 'label_engr',
+        scale_pos_weight = 1,
+        fn_penalize = 1,
+        fp_penalize = 1
     ):
-        self.n_splits = n_splits
+        self.num_splits = num_splits
         self.test_size = test_size
         self.early_stopping_rounds = early_stopping_rounds
         self.scale_features = scale_features
         self.n_threshold_points = n_threshold_points
         self.gridSearch = gridSearch
-        
+        self.label_name = re.findall(r'(abx2|engr)', label_name)[0].upper()
+        self.fn_penalize = fn_penalize
+        self.fp_penalize = fp_penalize
+
         # Base parameters that won't be tuned
         self.base_params = {
             "objective": "binary:logistic",
             "eval_metric": "aucpr",
-            "scale_pos_weight": 2,
-            'alpha': 1,
-            'beta': 3
+            "scale_pos_weight": scale_pos_weight,
+            "tree_method": "hist",  # Enables histogram-based tree growth for efficiency
+            "n_jobs": n_cpus,  # Uses all available CPU cores
         }
         
         self.safe_params = {
@@ -143,15 +148,38 @@ class XGBoostEvaluator:
             'gamma': [0, 0.1, 0.2],
             'subsample': [0.8, 0.9, 1.0],
             'colsample_bytree': [0.8, 0.9, 1.0],
-            'learning_rate': [0.01, 0.05, 0.1],
-            # "scale_pos_weight": [1 ,2, 3, 4, 5, 6]
-            # 'alpha': [1, 5, 6, 7, 10]
+            'learning_rate': [0.01, 0.05, 0.1]
         }
 
-        set_alpha = self.base_params.get('alpha', '')
-        set_spw = self.base_params.get('scale_pos_weight', '')
-        global training_file
-        set_experiment(f'{label_name}_{training_file}_{set_alpha}_{set_spw}')
+    
+
+        if self.label_name =='ENGR':
+            set_experiment(f'{self.label_name}_fpp:{self.fp_penalize}_spw:{self.base_params["scale_pos_weight"]}')
+        elif self.label_name == 'ABX2':
+            set_experiment(f'{self.label_name}_fnp:{self.fn_penalize}_spw:{self.base_params["scale_pos_weight"]}')
+
+
+    def custom_objective_function(self, preds, dtrain):
+        """
+        Custom objective function that:
+        - Gives high penalty for missing any infection that needs antibiotics(can be false positive or false negative depending on the label assignement).
+        """
+
+        # https://machinelearningmastery.com/cost-sensitive-learning-for-imbalanced-classification/
+        labels = dtrain.get_label()
+        probs = 1 / (1 + np.exp(-preds))  # Sigmoid to convert raw scores to probabilities
+
+        grad = np.zeros_like(probs)
+        hess = probs * (1 - probs)  # Standard logistic Hessian
+
+        # High penalty for false negatives (missing true positives)
+        # Particularly for Class 1, but you can adjust this to balance Class 0
+        grad[labels == 1] = self.fn_penalize * (probs[labels == 1] - 1)  # Push towards predicting 1 for Class 1
+
+        # Moderate penalty for Class 0 False Positives (FP), while allowing some flexibility
+        grad[labels == 0] = self.fp_penalize * probs[labels == 0]  # Push towards predicting 0 for Class 0
+
+        return grad, hess
     
     def calculate_metrics_at_threshold(self, y_true, y_pred_proba, threshold):
         """Calculate precision, recall, and F1 score at a given threshold"""
@@ -177,17 +205,17 @@ class XGBoostEvaluator:
         
         return precision, recall, specificity, fpr, f1, aucpr
 
-    def evaluate_single_split(self, X, y, random_state):
+    def evaluate_single_split(self, X, y, random_state, sample_scale_weight):
         """Evaluate model on a single train-test split using StratifiedShuffleSplit"""
-        def stratified_shuffle_split(X, y, random_state=random_state):
+        def stratified_shuffle_split(X, y, random_state=random_state, sample_scale_weight=sample_scale_weight):
             # Initial train-test split using StratifiedShuffleSplit
             sss = StratifiedShuffleSplit(n_splits=1, test_size=self.test_size, random_state=random_state)
             train_idx, test_idx = next(sss.split(X, y))
 
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            X_train, X_test, sample_scale_weight = X.iloc[train_idx], X.iloc[test_idx], sample_scale_weight.iloc[train_idx]
+            y_train, y_test, = y.iloc[train_idx], y.iloc[test_idx]
 
-            return X_train, X_test, y_train, y_test
+            return X_train, X_test, y_train, y_test, sample_scale_weight
         
         def scale_features(X_train, X_test):
             # Scale features if requested
@@ -197,35 +225,16 @@ class XGBoostEvaluator:
 
             return X_train, X_test
         
-        def convert_to_dmatrix(X_train, y_train, X_test, y_test):
+        def convert_to_dmatrix(X_train, y_train, X_test, y_test, sample_scale_weight):
             # Convert to DMatrix
-            dtrain = xgb.DMatrix(X_train, label=y_train)
-            dtest = xgb.DMatrix(X_test, label=y_test)
+            dtrain = xgb.DMatrix(X_train, label=y_train, weight = sample_scale_weight, enable_categorical = True)
+            dtest = xgb.DMatrix(X_test, label=y_test, enable_categorical= True)
 
             return dtrain, dtest
 
 
         def cross_validation_for_best_parameter(X_train, y_train, dtrain, param_combinations, test_size = 0.2, random_state = random_state, gridSearch = True):
-            def cv(current_params):
-                cv_results = xgb.cv(
-                        params=current_params,
-                        dtrain=dtrain,
-                        num_boost_round=1000,
-                        folds=list(cv_splitter.split(X_train, y_train)),
-                        early_stopping_rounds=self.early_stopping_rounds,
-                        obj=custom_objective_function,
-                        verbose_eval=False,
-                        metrics=['aucpr']  # Changed to AUCPR to match base params
-                    )
-
-                    # Store results
-                cv_results_all.append({
-                    'params': current_params,
-                    'cv_results': cv_results,
-                    'best_score': cv_results['test-aucpr-mean'].max(),  # Changed to AUCPR
-                    'best_iteration': len(cv_results)
-                })
-
+            
             # Cross-validation splitter for parameter tuning
             cv_splitter = StratifiedShuffleSplit(
                 n_splits=5,
@@ -233,21 +242,50 @@ class XGBoostEvaluator:
                 random_state=random_state
             )
 
-            # Store results for each parameter combination
-            cv_results_all = []
+            def cv(current_params):
+                print(f"[PID {os.getpid()}] Starting CV with params: {current_params}")
+                cv_results = xgb.cv(
+                        params=current_params,
+                        dtrain=dtrain,
+                        num_boost_round=1000,
+                        folds=list(cv_splitter.split(X_train, y_train)),
+                        early_stopping_rounds=self.early_stopping_rounds,
+                        obj=self.custom_objective_function,
+                        verbose_eval=False,
+                        metrics=['aucpr']  # Changed to AUCPR to match base params
+                    )
+
+                    # Store results
+                return({
+                    'params': current_params,
+                    'cv_results': cv_results,
+                    'best_score': cv_results['test-aucpr-mean'].max(),  # Changed to AUCPR
+                    'best_iteration': len(cv_results)
+                })
+
+           
 
             # Perform cross-validation for each parameter combination
             if gridSearch:
-                for params in param_combinations:
-                    # Combine base parameters with current parameter set
-                    current_params = {**self.base_params, **params}
-                    cv(current_params)
-            
+                # print(len([({**self.base_params, **params}) for params in param_combinations]))
+                cv_results_all = Parallel(n_jobs=n_cpus)(delayed(cv)({**self.base_params, **params}) for params in param_combinations)
+                store_all_cv_results(cv_results_all)
+                best_cv_result = max(cv_results_all, key=lambda x: x['best_score'])
+
             else:
                 current_params = {**self.base_params, **self.safe_params}
-                cv(current_params)
+                cv_results_all = cv(current_params)
+                store_all_cv_results(cv_results_all)
+                
+                best_cv_result = cv_results_all
 
-            return cv_results_all
+                if gridSearch == 'bayes':
+                    pass
+        
+            best_params = best_cv_result['params']
+            best_num_rounds = best_cv_result['best_iteration']
+
+            return best_params, best_num_rounds
         
 
         def train_model(dtrain, dtest, y_test, best_params, best_num_rounds):
@@ -255,7 +293,7 @@ class XGBoostEvaluator:
             model = xgb.train(
                 params=best_params,
                 dtrain=dtrain,
-                obj = custom_objective_function,
+                obj = self.custom_objective_function,
                 num_boost_round=best_num_rounds,
                 evals=[(dtest, "test")],
                 verbose_eval=False
@@ -273,7 +311,7 @@ class XGBoostEvaluator:
                     y_test, y_pred_proba, threshold
                 )
                 threshold_metrics.append({
-                    'threshold': threshold,
+                    'threshold':threshold,
                     'precision': precision,
                     'recall': recall,
                     'specificity': specificity,
@@ -286,14 +324,12 @@ class XGBoostEvaluator:
             return model, y_pred_proba, threshold_metrics_df
         
 
-        X_train, X_test, y_train, y_test = stratified_shuffle_split(X, y, random_state)
+        X_train, X_test, y_train, y_test, sample_scale_weight = stratified_shuffle_split(X, y, random_state, sample_scale_weight)
 
         if self.scale_features:
             X_train, X_test = scale_features(X_train, X_test)
 
-        dtrain, dtest = convert_to_dmatrix(X_train, y_train, X_test, y_test)
-
-
+        dtrain, dtest = convert_to_dmatrix(X_train, y_train, X_test, y_test, sample_scale_weight)
 
          # Generate parameter combinations
         param_combinations = [
@@ -301,16 +337,12 @@ class XGBoostEvaluator:
             for v in itertools.product(*self.param_grid.values())
         ]
 
-        cv_results_all = cross_validation_for_best_parameter(X_train, y_train, dtrain, param_combinations, test_size = 0.2, random_state = random_state, gridSearch = self.gridSearch)
-        
+        best_params, best_num_rounds = cross_validation_for_best_parameter(X_train, y_train, dtrain, param_combinations, test_size = 0.2, random_state = random_state, gridSearch = self.gridSearch)
         # Find best parameters
-        best_cv_result = max(cv_results_all, key=lambda x: x['best_score'])
-        best_params = best_cv_result['params']
-        best_num_rounds = best_cv_result['best_iteration']
-
+        
         model, y_pred_proba, threshold_metrics_df = train_model(dtrain, dtest, y_test, best_params, best_num_rounds)
 
-        best_params['num_boost_rounds'] = best_cv_result['best_iteration']
+        best_params['num_boost_rounds'] = best_num_rounds
         
 
         # Get feature importance
@@ -333,7 +365,7 @@ class XGBoostEvaluator:
         
        
         
-        log_model(model, best_params, aucpr, dtrain, random_state)
+        log_model(model, best_params, aucpr, dtrain, random_state, self.label_name)
         
         return {
             'optimal_thresholds_performance': optimal_threshold_performance,
@@ -342,29 +374,25 @@ class XGBoostEvaluator:
             'probabilities': y_pred_proba,
             'true_labels': y_test,
             'best_params': best_params,
-            'cv_results_all': cv_results_all
         }
     
-    def evaluate_multiple_splits(self, X, y):
+    def evaluate_multiple_splits(self, X, y, sample_scale_weight):
         """Evaluate model across multiple train-test splits"""
         model_performance = []
         all_threshold_metrics = []
         feature_importances = []
         pred_results = []
         best_params = []
-        cv_results = []
-        
-        for i in range(self.n_splits):
+        for i in range(self.num_splits):
             if i%1==0:
                 print(f'{i+1} split')
-            split_result = self.evaluate_single_split(X, y, random_state=i)
+            split_result = self.evaluate_single_split(X, y, random_state=i, sample_scale_weight=sample_scale_weight)
             model_performance.append(split_result['optimal_thresholds_performance'])
             all_threshold_metrics.append(split_result['threshold_metrics'])
             feature_importances.append(split_result['feature_importance'])
             pred_results.append({'true':split_result['true_labels'], 'predicted':split_result['probabilities']})
             best_params.append(split_result['best_params'])
-            cv_results.append(pd.DataFrame(split_result['cv_results_all']))
-        
+         
         # Calculate mean and std of metrics across all splits for each threshold
         threshold_metrics_mean = pd.concat(all_threshold_metrics).groupby('threshold').mean()
         threshold_metrics_std = pd.concat(all_threshold_metrics).groupby('threshold').std()
@@ -384,7 +412,6 @@ class XGBoostEvaluator:
         std_importance = importance_df.std()
         
         model_performance = pd.DataFrame(model_performance)
-        cv_results = pd.concat(cv_results)
         
         # Rest of the aggregation code remains the same
         return {
@@ -399,7 +426,6 @@ class XGBoostEvaluator:
                 'std_importance': std_importance
             }).sort_values('mean_importance', ascending=False),\
             'model_performance_at0.5': model_performance,
-            'cv_results_agg' : cv_results,
             'pred_results': pd.DataFrame(pred_results)
         }
 
@@ -457,34 +483,64 @@ def plot_results(results, save_fig = True):
 
     plt.tight_layout()
     if save_fig:
-        fig.savefig(f'{directory_path}/{n_splits}_Results.png')
+        fig.savefig(f'{directory_path}/{num_splits}_Results.png')
     return fig
 
 
 if __name__=='__main__':
-    training_file = 'Training0321_1to4_filter_abx+engr.xlsx'
-    df = pd.read_excel(training_file)
-    label_name = 'label_engr'
-    turn_warnings = False
+    n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", -1))
+    config = get_config()
+    print(f'CPU: {n_cpus}')
+
+    # datasets
+    training_file = config['datasets']
+
+    # preprocessing
+    scale_features = config['preprocessing']['scale_features']
+
+    # experiment
+    num_splits = config['experiment']['num_splits']
+    test_size = config['experiment']['test_size']
+    n_threshold_points = config['experiment']['n_threshold_points']
+    gridSearch = config['experiment']['gridSearch']
+    turn_warnings = config['experiment']['turn_warnings']
+
+    # training specs
+    scale_pos_weight = config['training_specs']['scale_pos_weight']
+    fp_penalize = config['training_specs']['fp_penalize']
+    fn_penalize = config['training_specs']['fn_penalize']
+    sample_scale_weight = config['training_specs']['sample_scale_weight']
+    early_stopping_rounds = config['training_specs']['early_stopping_rounds']
+    
+
+    features = config['features']
+    label_name = config['labels']
+    
     if not turn_warnings:
         warnings.filterwarnings("ignore")
-    features = ['Age', 
-       'TTemp_Max_TT_new', 'TT Fever Start (DPI)_new','TTemp_Interp__ar_coefficient__coeff_0__k_10',
-       'TTemp_Interp__change_quantiles__f_agg_"var"__isabs_False__qh_1.0__ql_0.6',
-       'TTemp_Interp__fft_coefficient__attr_"abs"__coeff_1',
-       'TTemp_Interp__fft_coefficient__attr_"angle"__coeff_30',
-       'TTemp_Interp__agg_linear_trend__attr_"intercept"__chunk_len_10__f_agg_"var"',
-       'TTemp_Interp__energy_ratio_by_chunks__num_segments_10__segment_focus_9', label_name]
     
-    tf_ids, df_features, labels = get_features_df(df, features, label_name)
+    df = pd.read_excel(training_file)
+
+    tf_ids, df_features, labels, sample_scale_weight = get_features_df(df, features, label_name, sample_scale_weight)
+
     # Usage example
-    n_splits = 1000
-    print(f'This script will build model {n_splits} times')
-    evaluator = XGBoostEvaluator(n_splits= n_splits,  test_size=0.2,  scale_features = False, n_threshold_points=1000, gridSearch = True)
+
+    print(f'This script will build model {num_splits} times')
+    evaluator = XGBoostEvaluator(num_splits= num_splits,
+                                 test_size = test_size,
+                                 early_stopping_rounds=early_stopping_rounds,
+                                scale_features = scale_features,
+                                n_threshold_points = n_threshold_points,
+                                      gridSearch = gridSearch,
+                                          label_name = label_name,
+                                          scale_pos_weight = scale_pos_weight,
+                                          fp_penalize=fp_penalize,
+                                            fn_penalize = fn_penalize)
+    
     print('Building and evaluating the model..')
-    results = evaluator.evaluate_multiple_splits(df_features, labels)
+    results = evaluator.evaluate_multiple_splits(df_features, labels, sample_scale_weight)
        
-    current_time =  datetime.now().replace(microsecond=0)
+    current_time =  str(datetime.now().replace(microsecond=0)).replace(' ', '_')
 
     # Specify the directory path you want to create
     directory_path = f"results/{current_time}"
@@ -493,7 +549,6 @@ if __name__=='__main__':
     os.makedirs(directory_path, exist_ok=True)
 
     results['model_performance_at0.5'].to_csv(directory_path+'/performance_per_model.csv', index_label = 'Model#')
-    results['cv_results_agg'].to_csv(directory_path +'/cv_results_agg.csv', index = False)
     results['pred_results'].to_csv(directory_path+'/pred_results.csv', index = False)
     results['threshold_all'].to_csv(directory_path+'/threshold_metrics.csv', index = False)
     results['feature_importance'].to_csv(directory_path+'/feature_importance.csv', index = False)

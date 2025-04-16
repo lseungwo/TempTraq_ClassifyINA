@@ -1,12 +1,34 @@
-label_name: 'label_engr'
-fp_penalize: 1.5
-fn_penalize: 1
-scale_pos_weight: 2.5
-turn_warnings: False
-num_splits: 100
-test_size: 0.2
-scale_features: False
-n_threshold_points: 1000
-gridSearch: True
-sample_scale_weight: 'sample_scale'
-early_stopping_rounds: 100
+datasets:
+  'Training0414_1to4_filter_abx+engr.xlsx'
+
+preprocessing:
+  scale_features: False
+
+experiment:
+  num_splits: 50
+  test_size: 0.2
+  n_threshold_points: 1000
+  gridSearch: False
+  turn_warnings: False
+
+training_specs:
+  scale_pos_weight: 2  # imbalanced dataset
+  fp_penalize: 1  # penalizing false positive
+  fn_penalize: 1  # penalizing true positive
+  sample_scale_weight: 'sample_scale' # sample weights for INA
+  early_stopping_rounds: 20
+  
+features:
+  - Age
+  - TTemp_Max_TT_new
+  - TT Fever Start (DPI)_new
+  - DetectedBy
+  - TTemp_Interp__ar_coefficient__coeff_0__k_10
+  - TTemp_Interp__change_quantiles__f_agg_"var"__isabs_False__qh_1.0__ql_0.6
+  - TTemp_Interp__fft_coefficient__attr_"abs"__coeff_1
+  - TTemp_Interp__fft_coefficient__attr_"angle"__coeff_30
+  - TTemp_Interp__agg_linear_trend__attr_"intercept"__chunk_len_10__f_agg_"var"
+  - TTemp_Interp__energy_ratio_by_chunks__num_segments_10__segment_focus_9
+
+labels:
+  'label_engr'

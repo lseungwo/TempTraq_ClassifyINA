@@ -1,8 +1,21 @@
 #Data Files
-*.csv
+data/
 *.xlsx
 #Results
 *.png
 results/
 #VirtualEnvironment
 venv/
+#MLRun                                                                                                                                                                                                                                        
+mlruns/                                                                                                                                                                                                                                       
+mlflow.db                                                                                                                                                                                                                                     
+#CacheFiles                                                                                                                                                                                                                                   
+__pycache__/                                                                                                                                                                                                                                  
+*.pyc
+#Singularity/DockerFiles
+Dockerfile
+*.def
+*.sif
+apptainer-1.4.0/
+#DBFiles
+*.db

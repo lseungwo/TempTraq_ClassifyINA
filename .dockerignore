@@ -1,13 +1,20 @@
 #Data Files
 data/
+#Apptainer directory
+apptainer-1.4.0/
+#.sif files
+*.sif
 #Results
 *.png
 results/
 #VirtualEnvironment
 venv/
 #MLRun
+model_logging.py
 mlruns/
 mlflow.db
 #CacheFiles
 __pycache__/
 *.pyc
+#run.sh
+run.sh

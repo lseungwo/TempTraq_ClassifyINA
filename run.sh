@@ -9,5 +9,5 @@
 
 #SBATCH --account=mtewari0
 #SBATCH --partition=standard
-#SBATCH --output=/nfs/turbo/umms-mtewari-sen/TempTraq_ClassifyINA/log/%u/%j.log
+#SBATCH --output=/nfs/turbo/umms-mtewari-sen/TempTraq_ClassifyINA/log/%j.log
 # COMMENT:The application(s) to execute along with its input arguments and options:
